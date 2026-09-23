@@ -6,7 +6,8 @@ use wm_platform::{NativeWindow, Point, RectDelta};
 use crate::{
   commands::{
     container::{
-      attach_container, detach_container, set_focused_descendant,
+      attach_container, detach_container, normalize_split_containers,
+      set_focused_descendant,
     },
     window::{dwindle_split, run_window_rules},
   },
@@ -47,6 +48,10 @@ pub fn manage_window(
 
   if let WindowContainer::TilingWindow(tiling_window) = &window {
     dwindle_place(tiling_window, use_cursor, state, config)?;
+
+    if let Some(workspace) = tiling_window.workspace() {
+      normalize_split_containers(&workspace.into())?;
+    }
   }
 
   // Set the newly added window as focus descendant. This means the window

@@ -57,3 +57,33 @@ pub fn flatten_child_split_containers(
 
   Ok(())
 }
+
+/// Flattens every redundant split container below the given container:
+/// split containers with a single child, and split containers with the
+/// same tiling direction as their parent.
+///
+/// Deepest containers are handled first, so that e.g. `H[V[V[1]] 2]`
+/// becomes `H[1 2]`.
+pub fn normalize_split_containers(root: &Container) -> anyhow::Result<()> {
+  let splits = root
+    .descendants()
+    .filter_map(|container| container.as_split().cloned())
+    .collect::<Vec<_>>();
+
+  for split in splits.into_iter().rev() {
+    let Some(parent) = split.parent() else {
+      continue;
+    };
+
+    let same_direction = parent
+      .as_direction_container()
+      .is_ok_and(|parent| parent.tiling_direction() == split.tiling_direction());
+
+    if split.child_count() == 1 || same_direction {
+      flatten_split_container(split)?;
+    }
+  }
+
+  // A workspace left with a single split child takes over its direction.
+  flatten_child_split_containers(root)
+}

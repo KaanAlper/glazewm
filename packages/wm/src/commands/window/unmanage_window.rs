@@ -3,7 +3,7 @@ use wm_common::{WindowState, WmEvent};
 
 use crate::{
   commands::container::{
-    detach_container, flatten_child_split_containers,
+    detach_container, flatten_child_split_containers, normalize_split_containers,
     set_focused_descendant,
   },
   models::WindowContainer,
@@ -29,6 +29,15 @@ pub fn unmanage_window(
   // become V[H[2]], this will then need to be flattened to V[2].
   for ancestor in ancestors.iter().rev() {
     flatten_child_split_containers(ancestor)?;
+  }
+
+  // Deeper leftovers too (e.g. a split left with a single child), which
+  // otherwise make later moves produce extra columns.
+  if let Some(workspace) = ancestors.iter().find_map(|a| a.as_workspace().cloned()) {
+    normalize_split_containers(&workspace.clone().into())?;
+    state
+      .pending_sync
+      .queue_containers_to_redraw(workspace.tiling_children());
   }
 
   state.emit_event(WmEvent::WindowUnmanaged {

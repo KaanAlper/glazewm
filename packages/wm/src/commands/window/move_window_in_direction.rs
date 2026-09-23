@@ -6,7 +6,7 @@ use crate::{
   commands::container::{
     attach_container, detach_container, flatten_child_split_containers,
     flatten_split_container, move_container_within_tree,
-    resize_tiling_container, set_focused_descendant,
+    normalize_split_containers, resize_tiling_container, set_focused_descendant,
     wrap_in_split_container,
   },
   models::{
@@ -31,7 +31,19 @@ pub fn move_window_in_direction(
 ) -> anyhow::Result<()> {
   match window {
     WindowContainer::TilingWindow(window) => {
-      move_tiling_window(window, direction, state, config)
+      let workspace = window.workspace();
+      move_tiling_window(window, direction, state, config)?;
+
+      // Leftover single-child / same-direction splits would make later
+      // moves produce extra columns.
+      if let Some(workspace) = workspace {
+        normalize_split_containers(&workspace.clone().into())?;
+        state
+          .pending_sync
+          .queue_containers_to_redraw(workspace.tiling_children());
+      }
+
+      Ok(())
     }
     WindowContainer::NonTilingWindow(non_tiling_window) => {
       match non_tiling_window.state() {
@@ -167,6 +179,16 @@ pub fn dwindle_split(
     TilingDirection::Vertical
   };
 
+  tracing::debug!(
+    "dwindle_split: target_id={} rect={:?} width={} height={} side_by_side={} split_dir={:?}",
+    target.id(),
+    target_rect,
+    target_rect.width(),
+    target_rect.height(),
+    side_by_side,
+    split_direction
+  );
+
   let is_first = if let Some(direction) = move_direction {
     if split_direction == TilingDirection::from_direction(direction) {
       matches!(direction, Direction::Up | Direction::Left)
@@ -185,6 +207,13 @@ pub fn dwindle_split(
         point.y < target_rect.top + target_rect.height() / 2
       }
   };
+
+  tracing::debug!(
+    "dwindle_split: is_first={} move_direction={:?} point={:?}",
+    is_first,
+    move_direction,
+    point
+  );
 
   let target_parent = target
     .direction_container()

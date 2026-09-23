@@ -62,7 +62,8 @@ fn main() {
   res.set("ProductName", "GlazeWM");
   res.set("FileDescription", "GlazeWM");
 
-  let version_parts = env!("VERSION_NUMBER")
+  let version_number = std::env::var("VERSION_NUMBER").unwrap_or_else(|_| "0.0.0".to_string());
+  let version_parts = version_number
     .split('.')
     .take(3)
     .map(|part| part.parse().unwrap_or(0))
