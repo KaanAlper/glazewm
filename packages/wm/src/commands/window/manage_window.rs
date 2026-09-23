@@ -1,7 +1,7 @@
 use anyhow::Context;
 use tracing::info;
 use wm_common::{try_warn, WindowRuleEvent, WindowState, WmEvent};
-use wm_platform::{NativeWindow, RectDelta};
+use wm_platform::{NativeWindow, Point, RectDelta};
 
 use crate::{
   commands::{
@@ -31,6 +31,10 @@ pub fn manage_window(
     return Ok(());
   };
 
+  // Without a target parent the window was just opened (place it under the
+  // cursor); with one, it's being managed on startup (build a spiral).
+  let use_cursor = target_parent.is_none();
+
   // Create the window instance. This may fail if the window handle has
   // already been destroyed.
   let window = try_warn!(create_window(
@@ -40,6 +44,10 @@ pub fn manage_window(
     state,
     config
   ));
+
+  if let WindowContainer::TilingWindow(tiling_window) = &window {
+    dwindle_place(tiling_window, use_cursor, state, config)?;
+  }
 
   // Set the newly added window as focus descendant. This means the window
   // rules will be run as if the window is focused.
@@ -389,9 +397,12 @@ fn insertion_target(
 ///
 /// The window under the cursor (or else the previously focused tiling
 /// window) is split along its longer side, and the new window takes the
-/// half the cursor is over.
+/// half the cursor is over. Without `use_cursor`, the last focused window
+/// is split and the new window takes the second half, which builds
+/// Hyprland's spiral when windows are managed one after another.
 fn dwindle_place(
   window: &TilingWindow,
+  use_cursor: bool,
   state: &WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
@@ -407,7 +418,7 @@ fn dwindle_place(
     .collect::<Vec<_>>();
 
   let cursor = state.dispatcher.cursor_position()?;
-  let under_cursor = others.iter().find(|other| {
+  let under_cursor = others.iter().filter(|_| use_cursor).find(|other| {
     other
       .to_rect()
       .is_ok_and(|rect| rect.contains_point(&cursor))
@@ -424,7 +435,16 @@ fn dwindle_place(
   };
 
   match target {
-    Some(target) => dwindle_split(window, &target, &cursor, false, config),
+    Some(target) => {
+      let point = if use_cursor {
+        cursor
+      } else {
+        // Outside the target, so the second half is taken.
+        Point { x: i32::MAX, y: i32::MAX }
+      };
+
+      dwindle_split(window, &target, &point, None, config)
+    }
     // First tiling window on the workspace: it fills the workspace.
     None => attach_container(
       &window.clone().into(),
