@@ -5,12 +5,14 @@ use wm_platform::{NativeWindow, RectDelta};
 
 use crate::{
   commands::{
-    container::{attach_container, set_focused_descendant},
-    window::run_window_rules,
+    container::{
+      attach_container, detach_container, set_focused_descendant,
+    },
+    window::{dwindle_split, run_window_rules},
   },
   models::{
     Container, Monitor, NativeWindowProperties, NonTilingWindow,
-    TilingWindow, WindowContainer,
+    TilingContainer, TilingWindow, WindowContainer,
   },
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -70,6 +72,34 @@ pub fn manage_window(
     state.pending_sync.queue_workspace_to_reorder(
       window.workspace().context("No workspace.")?,
     );
+
+    // Like Hyprland, never show a new window before it's in its final
+    // place: cloak it and move it there synchronously. The redraw below
+    // uncloaks it (or keeps it cloaked on a hidden workspace).
+    #[cfg(target_os = "windows")]
+    if window.state() == WindowState::Tiling
+      && config.value.general.hide_method == wm_common::HideMethod::Cloak
+    {
+      use wm_platform::{
+        NativeWindowWindowsExt, WindowZOrder, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING,
+      };
+
+      let rect = window
+        .to_rect()?
+        .apply_delta(&window.total_border_delta()?, None);
+
+      if window.native().set_cloaked(true).is_ok() {
+        let _ = window.native().set_window_pos(
+          &WindowZOrder::Normal,
+          &rect,
+          SWP_NOACTIVATE
+            | SWP_NOCOPYBITS
+            | SWP_NOSENDCHANGING
+            | SWP_FRAMECHANGED,
+        );
+      }
+    }
 
     // Sibling containers need to be redrawn if the window is tiling.
     state.pending_sync.queue_container_to_redraw(
@@ -352,4 +382,54 @@ fn insertion_target(
     focused_workspace.clone().into(),
     focused_workspace.child_count(),
   ))
+}
+
+/// Places a new tiling window like Hyprland's dwindle layout
+/// (`onWindowCreatedTiling` with `force_split = 0`).
+///
+/// The window under the cursor (or else the previously focused tiling
+/// window) is split along its longer side, and the new window takes the
+/// half the cursor is over.
+fn dwindle_place(
+  window: &TilingWindow,
+  state: &WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let workspace = window.workspace().context("No workspace.")?;
+  detach_container(window.clone().into())?;
+
+  let others = workspace
+    .descendants()
+    .filter_map(|container| match container.as_tiling_container() {
+      Ok(TilingContainer::TilingWindow(other)) => Some(other),
+      _ => None,
+    })
+    .collect::<Vec<_>>();
+
+  let cursor = state.dispatcher.cursor_position()?;
+  let under_cursor = others.iter().find(|other| {
+    other
+      .to_rect()
+      .is_ok_and(|rect| rect.contains_point(&cursor))
+  });
+
+  let target = match under_cursor {
+    Some(target) => Some(target.clone()),
+    None => workspace
+      .descendant_focus_order()
+      .find_map(|container| match container.as_tiling_container() {
+        Ok(TilingContainer::TilingWindow(other)) => Some(other),
+        _ => None,
+      }),
+  };
+
+  match target {
+    Some(target) => dwindle_split(window, &target, &cursor, false, config),
+    // First tiling window on the workspace: it fills the workspace.
+    None => attach_container(
+      &window.clone().into(),
+      &workspace.clone().into(),
+      Some(workspace.child_count()),
+    ),
+  }
 }
