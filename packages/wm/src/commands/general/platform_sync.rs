@@ -394,7 +394,7 @@ fn reposition_window(
     {
       use wm_platform::{
         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOCOPYBITS, SWP_NOSENDCHANGING, WS_MAXIMIZEBOX,
+        SWP_NOCOPYBITS, SWP_NOSENDCHANGING, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
       };
 
       // Restore window if it's minimized/maximized and shouldn't be. This
@@ -443,16 +443,39 @@ fn reposition_window(
           window.native().set_window_pos(z_order, &rect, swp_flags)?;
         }
         _ => {
-          swp_flags |= SWP_FRAMECHANGED;
+          // Skip `SetWindowPos` when the window is already at its target
+          // rect. Switching workspaces redraws every window being shown or
+          // hidden, and `SWP_FRAMECHANGED` forces each app to recalculate
+          // and repaint its frame and contents even if nothing moved,
+          // which loads DWM during workspace animations.
+          let unchanged = !should_restore
+            && !window.has_pending_dpi_adjustment()
+            && window.native().frame_with_shadows().ok().as_ref()
+              == Some(&rect);
 
-          window.native().set_window_pos(z_order, &rect, swp_flags)?;
+          if unchanged {
+            // Only the z-order may still need updating (e.g. a window
+            // that is no longer shown on top).
+            let is_topmost =
+              window.native().has_window_style_ex(WS_EX_TOPMOST);
 
-          // When there's a mismatch between the DPI of the monitor and the
-          // window, the window might be sized incorrectly after the first
-          // move. If we set the position twice, inconsistencies after the
-          // first move are resolved.
-          if window.has_pending_dpi_adjustment() {
+            if is_visible
+              && (*z_order != WindowZOrder::Normal || is_topmost)
+            {
+              window.native().set_z_order(z_order)?;
+            }
+          } else {
+            swp_flags |= SWP_FRAMECHANGED;
+
             window.native().set_window_pos(z_order, &rect, swp_flags)?;
+
+            // When there's a mismatch between the DPI of the monitor and
+            // the window, the window might be sized incorrectly after the
+            // first move. If we set the position twice, inconsistencies
+            // after the first move are resolved.
+            if window.has_pending_dpi_adjustment() {
+              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+            }
           }
         }
       }
