@@ -325,7 +325,11 @@ fn window_state_to_create(
   // workspace, it would still not be initialized as fullscreen. The window
   // needs to be within the workspace's outer gaps by at least 1px on each
   // side.
+  // Only borderless windows that can't be resized (e.g. games) are
+  // initialized as fullscreen. A resizable app that restores a
+  // screen-sized window from its last session (e.g. a browser) is tiled.
   if !native_properties.is_maximized
+    && !native_properties.is_resizable
     && native_properties
       .frame
       .inset(1)

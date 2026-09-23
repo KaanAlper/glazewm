@@ -111,6 +111,22 @@ pub fn handle_window_moved_or_resized(
       return Ok(());
     }
 
+    // Like Hyprland's `suppressevent maximize`: a tiling window that
+    // maximizes itself (e.g. Firefox/Zen restoring the maximized state of
+    // its last session) stays tiled instead of becoming an on-top
+    // fullscreen window. Fullscreen remains available through the
+    // `toggle-fullscreen` command.
+    #[cfg(target_os = "windows")]
+    if is_maximized
+      && !old_is_maximized
+      && matches!(window.state(), WindowState::Tiling)
+    {
+      tracing::info!("Suppressing maximize of tiling window: {window}");
+      try_warn!(window.native().restore(None));
+      state.pending_sync.queue_container_to_redraw(window.clone());
+      return Ok(());
+    }
+
     // Detect whether the window is starting to be interactively moved or
     // resized by the user (e.g. via the window's drag handles).
     let is_drag_start = !state.is_paused && {
