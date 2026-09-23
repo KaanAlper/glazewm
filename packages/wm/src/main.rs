@@ -20,7 +20,7 @@ use tracing_subscriber::{
   fmt::{self, writer::MakeWriterExt},
   layer::SubscriberExt,
 };
-use wm_common::{AppCommand, InvokeCommand, Verbosity, WmEvent};
+use wm_common::{AppCommand, Verbosity, WmEvent};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
@@ -30,7 +30,7 @@ use wm_platform::{
 };
 
 use crate::{
-  ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
+  ipc_server::IpcServer, user_config::UserConfig,
   wm::WindowManager,
 };
 
@@ -39,7 +39,6 @@ mod events;
 mod ipc_server;
 mod models;
 mod pending_sync;
-mod sys_tray;
 mod traits;
 mod user_config;
 mod wm;
@@ -120,8 +119,8 @@ async fn start_wm(
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
 
-  // Add application icon to system tray.
-  let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
+  // Logical Lunge: no tray icon -- the shell's bar is the UI (reload / exit are
+  // available as keybindings and through IPC).
 
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
 
@@ -189,10 +188,7 @@ async fn start_wm(
         tracing::info!("Exiting through WM command.");
         break;
       },
-      Some(()) = tray.exit_rx.recv() => {
-        tracing::info!("Exiting through system tray.");
-        break;
-      },
+
       Some(event) = mouse_listener.next_event() => {
         tracing::debug!("Received mouse event: {:?}", event);
         wm.process_event(PlatformEvent::Mouse(event), &mut config)
@@ -272,13 +268,7 @@ async fn start_wm(
 
         Ok(())
       },
-      Some(()) = tray.config_reload_rx.recv() => {
-        wm.process_commands(
-          &vec![InvokeCommand::WmReloadConfig],
-          None,
-          &mut config,
-        ).map(|_| ())
-      },
+
     };
 
     if let Err(err) = res {
