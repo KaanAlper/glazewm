@@ -3,8 +3,12 @@ use tracing::{info, warn};
 use wm_common::WindowState;
 
 use crate::{
-  commands::container::{
-    move_container_within_tree, replace_container, resize_tiling_container,
+  commands::{
+    container::{
+      move_container_within_tree, normalize_split_containers,
+      replace_container, resize_tiling_container,
+    },
+    window::dwindle_place,
   },
   models::{Container, InsertionTarget, WindowContainer},
   traits::{CommonGetters, TilingSizeGetters, WindowGetters},
@@ -49,37 +53,6 @@ fn set_tiling(
   let workspace =
     window.workspace().context("Window has no workspace.")?;
 
-  // Check whether insertion target is still valid.
-  let insertion_target =
-    window.insertion_target().filter(|insertion_target| {
-      insertion_target
-        .target_parent
-        .workspace()
-        .is_some_and(|workspace| workspace.is_displayed())
-    });
-
-  // Get the position in the tree to insert the new tiling window. This
-  // will be the window's previous tiling position if it has one, or
-  // instead beside the last focused tiling window in the workspace.
-  let (target_parent, target_index) = insertion_target
-    .as_ref()
-    .map(|insertion_target| {
-      (
-        insertion_target.target_parent.clone(),
-        insertion_target.target_index,
-      )
-    })
-    // Fallback to the last focused tiling window within the workspace.
-    .or_else(|| {
-      let focused_window = workspace
-        .descendant_focus_order()
-        .find(Container::is_tiling_window)?;
-
-      Some((focused_window.parent()?, focused_window.index() + 1))
-    })
-    // Default to inserting at the end of the workspace.
-    .unwrap_or((workspace.clone().into(), workspace.child_count()));
-
   let tiling_window = window.to_tiling(config.value.gaps.clone());
 
   // Replace the original window with the created tiling window.
@@ -89,24 +62,13 @@ fn set_tiling(
     window.index(),
   )?;
 
-  move_container_within_tree(
-    &tiling_window.clone().into(),
-    &target_parent,
-    target_index,
-    state,
-  )?;
+  // Like Hyprland, a window that becomes tiled again (e.g. restored after
+  // Win+D minimized everything) is re-inserted with the dwindle split of the
+  // last focused tiling window instead of returning to its old column.
+  dwindle_place(&tiling_window, false, state, config)?;
+  normalize_split_containers(&workspace.clone().into())?;
 
-  #[allow(clippy::cast_precision_loss)]
-  if let Some(insertion_target) = &insertion_target {
-    let size_scale = (insertion_target.prev_sibling_count + 1) as f32
-      / (tiling_window.tiling_siblings().count() + 1) as f32;
-
-    // Scale the window's previous size based on the current number of
-    // siblings. E.g. if the window was 0.5 with 1 sibling, and now has 2
-    // siblings, scale to 0.5 * (2/3) to maintain proportional sizing.
-    let target_size = insertion_target.prev_tiling_size * size_scale;
-    resize_tiling_container(&tiling_window.clone().into(), target_size);
-  }
+  let target_parent = tiling_window.parent().context("No parent.")?;
 
   state
     .pending_sync

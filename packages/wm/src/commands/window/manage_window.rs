@@ -405,7 +405,7 @@ fn insertion_target(
 /// half the cursor is over. Without `use_cursor`, the last focused window
 /// is split and the new window takes the second half, which builds
 /// Hyprland's spiral when windows are managed one after another.
-fn dwindle_place(
+pub fn dwindle_place(
   window: &TilingWindow,
   use_cursor: bool,
   state: &WmState,
