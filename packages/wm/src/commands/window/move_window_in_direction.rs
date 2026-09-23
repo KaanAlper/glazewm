@@ -471,6 +471,13 @@ fn invert_workspace_tiling_direction(
       &workspace.clone().into(),
       &workspace_children,
     )?;
+  } else if let [TilingContainer::Split(split)] = workspace_children.as_slice()
+  {
+    // A lone split sibling rotates along with the workspace (dwindle), so
+    // it isn't flattened into the workspace afterwards. For example, in
+    // V[1 H[2 3]] where container 1 is moved left, this results in
+    // H[1 V[2 3]] instead of H[1 2 3].
+    split.set_tiling_direction(split.tiling_direction().inverse());
   }
 
   // Invert the tiling direction of the workspace.
