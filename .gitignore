@@ -13,3 +13,9 @@ out/
 # IDE files
 .vs/
 .idea/
+
+# local build leftovers
+/build_output.txt
+/glazewm.log
+/glazewm.err
+*.log
