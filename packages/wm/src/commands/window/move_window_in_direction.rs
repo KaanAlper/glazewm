@@ -10,8 +10,8 @@ use crate::{
     wrap_in_split_container,
   },
   models::{
-    DirectionContainer, Monitor, NonTilingWindow, SplitContainer,
-    TilingContainer, TilingWindow, WindowContainer,
+    Monitor, NonTilingWindow, SplitContainer, TilingContainer,
+    TilingWindow, WindowContainer, Workspace,
   },
   traits::{
     CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
@@ -70,8 +70,8 @@ pub fn move_window_in_direction(
 /// H[1 V[2 3]] where container 2 is moved left, this results in
 /// H[V[2 1] 3].
 ///
-/// Without a window in the given direction, GlazeWM's original move is
-/// used (move to the monitor in that direction, or change the split).
+/// Without a window in the given direction, the window takes that half of
+/// the workspace (see `move_tiling_window_fallback`).
 fn move_tiling_window(
   window_to_move: TilingWindow,
   direction: &Direction,
@@ -360,33 +360,57 @@ fn move_tiling_window_fallback(
     );
   }
 
-  // The window cannot be moved within the parent container, so traverse
-  // upwards to find an ancestor that has the correct tiling direction.
-  let target_ancestor = parent.ancestors().find_map(|ancestor| {
-    ancestor.as_direction_container().ok().filter(|ancestor| {
-      ancestor.tiling_direction()
-        == TilingDirection::from_direction(direction)
-    })
-  });
+  // Logical Lunge: there's no window in the given direction, so the window
+  // is at the workspace's edge on that side. Like Hyprland's dwindle
+  // `movetoroot`, it takes that half of the workspace and the rest of the
+  // layout keeps its shape in the other half. GlazeWM inserted it into the
+  // nearest ancestor with the move's axis instead, which added a column
+  // (e.g. a 2x2 grid became three columns).
+  let workspace = window_to_move.workspace().context("No workspace.")?;
 
-  match target_ancestor {
-    // If there is no suitable ancestor, then change the tiling direction
-    // of the workspace.
-    None => invert_workspace_tiling_direction(
-      window_to_move,
-      direction,
-      state,
-      config,
-    ),
-    // Otherwise, move the container into the given ancestor. This could
-    // simply be the container's direct parent.
-    Some(target_ancestor) => insert_into_ancestor(
-      &window_to_move,
-      &target_ancestor,
-      direction,
-      state,
-    ),
+  if workspace.tiling_direction() == TilingDirection::from_direction(direction)
+  {
+    move_to_workspace_edge(window_to_move, &workspace, direction, state)
+  } else {
+    invert_workspace_tiling_direction(window_to_move, direction, state, config)
   }
+}
+
+/// Moves a tiling window to the workspace's edge in the given direction,
+/// where it takes half of the workspace.
+///
+/// The workspace must already tile along the move axis. Its other children
+/// keep their order and relative sizes in the remaining half. For example,
+/// in the layout H[V[1 2] V[3 4]] where container 3 is moved right, this
+/// results in H[V[1 2] 4 3] with sizes 0.25, 0.25 and 0.5.
+fn move_to_workspace_edge(
+  window_to_move: TilingWindow,
+  workspace: &Workspace,
+  direction: &Direction,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  let target_index = match direction {
+    Direction::Left | Direction::Up => 0,
+    _ => workspace.child_count(),
+  };
+
+  move_container_within_tree(
+    &window_to_move.clone().into(),
+    &workspace.clone().into(),
+    target_index,
+    state,
+  )?;
+
+  // A split left with a single child (e.g. V[4]) or with the workspace's
+  // direction is merged into the workspace.
+  flatten_child_split_containers(&workspace.clone().into())?;
+  resize_tiling_container(&window_to_move.into(), 0.5);
+
+  state
+    .pending_sync
+    .queue_containers_to_redraw(workspace.tiling_children());
+
+  Ok(())
 }
 
 
@@ -538,44 +562,6 @@ fn invert_workspace_tiling_direction(
   state
     .pending_sync
     .queue_containers_to_redraw(workspace.tiling_children());
-
-  Ok(())
-}
-
-fn insert_into_ancestor(
-  window_to_move: &TilingWindow,
-  target_ancestor: &DirectionContainer,
-  direction: &Direction,
-  state: &mut WmState,
-) -> anyhow::Result<()> {
-  // Traverse upwards to find container whose parent is the target
-  // ancestor. Then, depending on the direction, insert before or after
-  // that container.
-  let window_ancestor = window_to_move
-    .ancestors()
-    .find(|container| {
-      container
-        .parent()
-        .is_some_and(|parent| parent == target_ancestor.clone().into())
-    })
-    .context("Window ancestor not found.")?;
-
-  let target_index = match direction {
-    Direction::Up | Direction::Left => window_ancestor.index(),
-    _ => window_ancestor.index() + 1,
-  };
-
-  // Move the window into the container above.
-  move_container_within_tree(
-    &window_to_move.clone().into(),
-    &target_ancestor.clone().into(),
-    target_index,
-    state,
-  )?;
-
-  state
-    .pending_sync
-    .queue_containers_to_redraw(target_ancestor.tiling_children());
 
   Ok(())
 }
