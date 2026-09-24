@@ -27,6 +27,20 @@ pub fn reload_config(
   // Re-evaluate user config file and set its values in state.
   config.reload()?;
 
+  // Apply the `borders:` section (start, update or stop the border engine).
+  #[cfg(target_os = "windows")]
+  match &config.value.borders {
+    Some(borders) => {
+      let json = serde_json::to_string(borders).unwrap_or_default();
+      if old_config.borders.is_some() {
+        wm_borders::reload(json);
+      } else {
+        wm_borders::start(json);
+      }
+    }
+    None => wm_borders::stop(),
+  }
+
   // Re-run window rules on all active windows.
   for window in state.windows() {
     window.set_done_window_rules(Vec::new());

@@ -39,3 +39,6 @@ wm-common = { path = "../wm-common" }
 wm-ipc-client = { path = "../wm-ipc-client" }
 wm-macros = { workspace = true }
 wm-platform = { path = "../wm-platform" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wm-borders = { path = "../wm-borders" }

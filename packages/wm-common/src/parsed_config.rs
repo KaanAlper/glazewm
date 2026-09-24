@@ -17,6 +17,11 @@ pub struct ParsedConfig {
   pub window_effects: WindowEffectsConfig,
   pub window_rules: Vec<WindowRuleConfig>,
   pub workspaces: Vec<WorkspaceConfig>,
+
+  /// Window borders drawn by the WM itself (Logical Lunge). Handed as-is to
+  /// the border engine; its keys are those of tacky-borders' config.yaml
+  /// (`global`, `window_rules`, `render_backend`). No borders if absent.
+  pub borders: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

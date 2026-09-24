@@ -124,6 +124,13 @@ async fn start_wm(
 
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
 
+  // Logical Lunge: window borders are drawn inside the WM process (no
+  // separate program or tray icon).
+  #[cfg(target_os = "windows")]
+  if let Some(borders) = &config.value.borders {
+    wm_borders::start(serde_json::to_string(borders).unwrap_or_default());
+  }
+
   let mut ipc_server = IpcServer::start().await?;
 
   // On Windows, start watcher process for restoring hidden windows on

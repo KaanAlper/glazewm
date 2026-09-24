@@ -787,6 +787,10 @@ impl WindowManager {
   ) {
     self.state.emit_event(WmEvent::ApplicationExiting);
 
+    // Remove the window borders drawn by the WM.
+    #[cfg(target_os = "windows")]
+    wm_borders::stop();
+
     // Bring back the windows of hidden workspaces. They are cloaked (or
     // hidden) and would otherwise stay invisible after the WM exits, e.g.
     // on an update, an uninstall or a restart.
