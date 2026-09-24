@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time;
+use std::time::{self, Duration};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -19,10 +20,30 @@ pub struct AnimationsConfig {
     active: Vec<AnimParamsConfig>,
     #[serde(default)]
     inactive: Vec<AnimParamsConfig>,
-    #[serde(default = "serde_default_i32::<60>")]
+    /// Logical Lunge: 0 (the default) follows the display's refresh rate. A fixed 60 made border
+    /// fades step visibly on a 144 Hz display.
+    #[serde(default = "serde_default_i32::<0>")]
     fps: i32,
     #[serde(default = "serde_default_bool::<true>")]
     enabled: bool,
+}
+
+/// The refresh rate DWM composes at, in frames per second (60 if unknown).
+fn display_refresh_rate() -> i32 {
+    let mut info = DWM_TIMING_INFO {
+        cbSize: size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+
+    // SAFETY: `info` is a valid, correctly sized `DWM_TIMING_INFO`; a null HWND asks for the
+    // composition timing of the whole desktop.
+    match unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) } {
+        Ok(()) if info.rateRefresh.uiDenominator > 0 && info.rateRefresh.uiNumerator > 0 => {
+            (info.rateRefresh.uiNumerator as f32 / info.rateRefresh.uiDenominator as f32).round()
+                as i32
+        }
+        _ => 60,
+    }
 }
 
 impl AnimationsConfig {
@@ -39,7 +60,7 @@ impl AnimationsConfig {
                     .iter()
                     .map(|params_config| params_config.to_anim_params())
                     .collect(),
-                fps: self.fps,
+                fps: if self.fps > 0 { self.fps } else { display_refresh_rate() },
                 ..Default::default()
             }
         } else {
@@ -177,8 +198,8 @@ impl Animations {
         last_anim_time: &mut Option<time::Instant>,
     ) {
         if self.timer.is_none() && (!self.active.is_empty() || !self.inactive.is_empty()) {
-            let timer_duration = (1000.0 / self.fps as f32) as u64;
-            self.timer = Some(AnimationTimer::new(border_window, timer_duration));
+            let interval = Duration::from_micros(1_000_000 / self.fps.max(1) as u64);
+            self.timer = Some(AnimationTimer::new(border_window, interval));
 
             *last_anim_time = Some(time::Instant::now());
         }

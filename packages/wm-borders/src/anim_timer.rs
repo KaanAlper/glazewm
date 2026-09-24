@@ -12,7 +12,7 @@ pub struct AnimationTimer {
 }
 
 impl AnimationTimer {
-    pub fn new(hwnd: HWND, interval_ms: u64) -> Self {
+    pub fn new(hwnd: HWND, interval: Duration) -> Self {
         let stop_flag = Arc::new(Mutex::new(false));
         let stop_flag_clone = stop_flag.clone();
 
@@ -22,7 +22,6 @@ impl AnimationTimer {
         // Spawn a worker thread for the timer
         thread::spawn(move || {
             let hwnd = HWND(hwnd_isize as _);
-            let interval = Duration::from_millis(interval_ms);
 
             while !*stop_flag_clone.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
                 if let Err(err) = post_message_w(Some(hwnd), WM_APP_ANIMATE, WPARAM(0), LPARAM(0)) {
