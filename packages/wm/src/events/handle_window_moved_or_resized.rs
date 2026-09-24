@@ -175,8 +175,11 @@ pub fn handle_window_moved_or_resized(
           // TODO: Might be more robust to also check if the window under
           // the cursor (i.e. via `dispatcher.window_from_point`) is not a
           // different window.
-          let cursor_position = state.dispatcher.cursor_position()?;
-          frame_to_check.contains_point(&cursor_position)
+          // The cursor is unavailable while the screen is locked; a
+          // window moving by itself then is no drag.
+          state.dispatcher.cursor_position().is_ok_and(|cursor_position| {
+            frame_to_check.contains_point(&cursor_position)
+          })
         } else {
           false
         }

@@ -426,11 +426,23 @@ pub fn dwindle_place(
     })
     .collect::<Vec<_>>();
 
-  let cursor = state.dispatcher.cursor_position()?;
-  let under_cursor = others.iter().filter(|_| use_cursor).find(|other| {
-    other
-      .to_rect()
-      .is_ok_and(|rect| rect.contains_point(&cursor))
+  // The cursor position is unavailable while the lock screen or the
+  // screen saver is the input desktop (`GetCursorPos` fails with access
+  // denied). The window is placed as on startup then, instead of failing
+  // after it has already been detached (which lost the window and made
+  // the WM unable to start while the screen was locked).
+  let cursor = if use_cursor {
+    state.dispatcher.cursor_position().ok()
+  } else {
+    None
+  };
+
+  let under_cursor = cursor.as_ref().and_then(|cursor| {
+    others.iter().find(|other| {
+      other
+        .to_rect()
+        .is_ok_and(|rect| rect.contains_point(cursor))
+    })
   });
 
   let target = match under_cursor {
@@ -445,12 +457,11 @@ pub fn dwindle_place(
 
   match target {
     Some(target) => {
-      let point = if use_cursor {
-        cursor
-      } else {
-        // Outside the target, so the second half is taken.
-        Point { x: i32::MAX, y: i32::MAX }
-      };
+      // Without a cursor: outside the target, so the second half is taken.
+      let point = cursor.unwrap_or(Point {
+        x: i32::MAX,
+        y: i32::MAX,
+      });
 
       dwindle_split(window, &target, &point, None, config)
     }
