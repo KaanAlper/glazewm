@@ -40,11 +40,12 @@ use crate::utils::{
     LogIfErr, OwnedHWND, ReentrancyBlocker, ReentrancyBlockerExt, StandaloneWindowsError,
     T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_ANIMATE, WM_APP_FOREGROUND,
     WM_APP_HIDECLOAKED, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
-    WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
+    WM_APP_MINIMIZESTART, WM_APP_PLACE, WM_APP_RECREATE_DRAWER, WM_APP_REORDER,
+    WM_APP_SHOWUNCLOAKED,
     WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
     get_dpi_for_monitor, get_monitor_info, get_window_title, has_native_border,
     is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
-    loword, monitor_from_window, post_message_w,
+    loword, monitor_from_rect, monitor_from_window, post_message_w, unpack_coords,
 };
 use crate::APP_STATE;
 
@@ -214,11 +215,11 @@ impl WindowBorder {
     }
 
     pub fn load_from_config(&mut self, window_rule: WindowRule, dpi: u32) -> anyhow::Result<()> {
-        let app_config = APP_STATE.config.read().unwrap();
+        let app_config = APP_STATE.config.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let is_initial_window = APP_STATE
             .initial_windows
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&(self.tracking_window.0 as isize));
 
         self.config = BorderConfig::resolve(
@@ -371,11 +372,12 @@ impl WindowBorder {
     // NOTE: Avoid calling this function + self.render() while the tracking window is minimized
     // as its coordinates will be meaningless and will lead to an oddly sized border.
     fn update_window_rect(&mut self) -> anyhow::Result<()> {
+        let mut frame = RECT::default();
         if let Err(e) = unsafe {
             DwmGetWindowAttribute(
                 self.tracking_window,
                 DWMWA_EXTENDED_FRAME_BOUNDS,
-                ptr::addr_of_mut!(self.window_rect) as _,
+                ptr::addr_of_mut!(frame) as _,
                 size_of::<RECT>() as u32,
             )
             .context(format!(
@@ -387,6 +389,13 @@ impl WindowBorder {
             return Err(e);
         }
 
+        self.set_window_rect(frame);
+        Ok(())
+    }
+
+    // Sets the border's rect from the tracking window's visible frame.
+    fn set_window_rect(&mut self, frame: RECT) {
+        self.window_rect = frame;
         let stroke_width = self.drawer.stroke_width;
         let border_padding = self.border_padding;
         // Make space for the border + padding
@@ -394,8 +403,6 @@ impl WindowBorder {
         self.window_rect.left -= stroke_width + self.border_offset.left + border_padding;
         self.window_rect.right += stroke_width + self.border_offset.right + border_padding;
         self.window_rect.bottom += stroke_width + self.border_offset.bottom + border_padding;
-
-        Ok(())
     }
 
     // NOTE: SetWindowPos is asynchronous, meaning it sends a request to the DWM but doesn't wait
@@ -447,7 +454,7 @@ impl WindowBorder {
     fn update_color(&mut self, check_delay: Option<u64>) {
         self.window_state.update(
             self.tracking_window.0 as isize,
-            *APP_STATE.active_window.lock().unwrap(),
+            *APP_STATE.active_window.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
 
         match self
@@ -539,7 +546,7 @@ impl WindowBorder {
                 .context("handle_directx_errors")
                 .to_windows_result(T_E_REENTRANCY)?;
 
-            if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut() {
+            if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
                 directx_devices
                     .recreate_if_needed()
                     .windows_context("could not recreate directx devices if needed")?;
@@ -751,9 +758,22 @@ impl WindowBorder {
             unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, border_pointer as _) };
         }
 
-        match !border_pointer.is_null() {
-            true => unsafe { (*border_pointer).wnd_proc(window, message, wparam, lparam) },
-            false => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        if border_pointer.is_null() {
+            return unsafe { DefWindowProcW(window, message, wparam, lparam) };
+        }
+
+        // Logical Lunge: a panic must not unwind out of the window procedure (that aborts the window manager's
+        // process). The border's state may be inconsistent afterwards, so its thread is ended (its window goes away);
+        // the window gets a new border the next time it is shown.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            (*border_pointer).wnd_proc(window, message, wparam, lparam)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                error!("border window procedure panicked (message {message:#x}); closing this border");
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
         }
     }
 
@@ -914,6 +934,12 @@ impl WindowBorder {
                     return LRESULT(0);
                 }
 
+                // Already shown by WM_APP_PLACE at the window manager's target frame. The window may not have
+                // processed its (asynchronous) move yet, so re-reading its rect here would jump back to the old one.
+                if !self.is_paused && is_window_visible(self.border_window.0) {
+                    return LRESULT(0);
+                }
+
                 if self.should_show_border() {
                     self.update_color(None);
                     self.update_window_rect().log_if_err();
@@ -923,6 +949,43 @@ impl WindowBorder {
                     self.drawer.set_anims_timer_if_needed(self.border_window.0);
                 }
 
+                self.is_paused = false;
+            }
+            // Logical Lunge: the window manager just moved or uncloaked the tracking window. Go to its target
+            // frame now instead of after the window's own LOCATIONCHANGE, so the border and the window move in the
+            // same step. That event still follows and corrects the rect if the window ended up elsewhere (e.g. a
+            // minimum size larger than its tile).
+            WM_APP_PLACE => {
+                if !is_window(Some(self.tracking_window)) {
+                    self.cleanup_and_queue_exit();
+                    return LRESULT(0);
+                }
+                if !self.should_show_border() {
+                    return LRESULT(0);
+                }
+
+                let (left, top) = unpack_coords(wparam.0);
+                let (right, bottom) = unpack_coords(lparam.0 as usize);
+                let frame = RECT { left, top, right, bottom };
+
+                // Moving to another monitor may change the scale: leave it to LOCATIONCHANGE
+                if monitor_from_rect(&frame) != self.current_monitor {
+                    return LRESULT(0);
+                }
+
+                let was_hidden = !is_window_visible(self.border_window.0);
+                if was_hidden {
+                    self.update_color(None);
+                }
+
+                let prev_rect = self.window_rect;
+                self.set_window_rect(frame);
+                self.update_position(was_hidden.then_some(SWP_SHOWWINDOW)).log_if_err();
+                if was_hidden || !are_rects_same_size(&self.window_rect, &prev_rect) {
+                    self.render().log_if_err();
+                }
+
+                self.drawer.set_anims_timer_if_needed(self.border_window.0);
                 self.is_paused = false;
             }
             // EVENT_OBJECT_HIDE / EVENT_OBJECT_CLOAKED
@@ -1024,7 +1087,7 @@ impl WindowBorder {
             // help detect adapter changes in specific scenarios (e.g. when a monitor is
             // connected/disconnected on an NVIDIA Optimus-supported laptop).
             WM_DEVICECHANGE if wparam.0 as u32 == DBT_DEVNODES_CHANGED => {
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
+                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut()
                     && let Err(err) = directx_devices.recreate_if_needed()
                 {
                     error!("could not recreate directx devices if needed: {err:#}");

@@ -16,7 +16,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+    MonitorFromWindow,
 };
 use windows::Win32::System::Diagnostics::Debug::FACILITY_ITF;
 use windows::Win32::System::Registry::{HKEY, RegCloseKey};
@@ -55,6 +56,8 @@ pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
 pub const WM_APP_SET_WIDTH: u32 = WM_APP + 11;
 pub const WM_APP_SET_OFFSET: u32 = WM_APP + 12;
 pub const WM_APP_SET_RADIUS: u32 = WM_APP + 13;
+// Logical Lunge: the window manager moved the tracking window (target frame packed in WPARAM/LPARAM).
+pub const WM_APP_PLACE: u32 = WM_APP + 14;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs
@@ -551,7 +554,7 @@ pub fn get_window_rule(hwnd: HWND) -> WindowRule {
         })
     };
 
-    let config = APP_STATE.config.read().unwrap();
+    let config = APP_STATE.config.read().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     for rule in config.window_rules.iter() {
         let window_name: &String = match rule.kind {
@@ -687,7 +690,7 @@ pub fn create_border_for_window(tracking_window: HWND, window_rule: WindowRule) 
         let tracking_window = HWND(tracking_window_isize as _);
 
         // Note: 'key' for the hashmap is the tracking window, 'value' is the border window
-        let mut borders_hashmap = APP_STATE.borders.lock().unwrap();
+        let mut borders_hashmap = APP_STATE.borders.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Check to see if there is already a border for the given tracking window
         if borders_hashmap.contains_key(&tracking_window_isize) {
@@ -712,25 +715,32 @@ pub fn create_border_for_window(tracking_window: HWND, window_rule: WindowRule) 
         let _ = tracking_window;
         let _ = tracking_window_isize;
 
-        if let Err(err) = border.init(window_rule) {
-            error!("could not initialize border: {err:#}");
-        } else {
-            // Window message loop
-            unsafe {
-                let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
+        // Logical Lunge: even if the border panics, it is removed from the hashmap below (a stale entry would keep
+        // the window from ever getting a new border).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Err(err) = border.init(window_rule) {
+                error!("could not initialize border: {err:#}");
+            } else {
+                // Window message loop
+                unsafe {
+                    let mut message = MSG::default();
+                    while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
                 }
-            }
-        };
+            };
+        }));
+        if outcome.is_err() {
+            error!("border thread panicked for {tracking_window_isize:#x}");
+        }
 
         // If the above loop exits, that means the border has been destroyed, so we should remove
         // it from the hashmap
         APP_STATE
             .borders
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&tracking_window_isize);
 
         debug!("exiting border thread for {:?}!", border.tracking_window);
@@ -777,6 +787,20 @@ pub fn monitor_from_window(hwnd: HWND) -> HMONITOR {
     unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
 }
 
+pub fn monitor_from_rect(rect: &RECT) -> HMONITOR {
+    unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST) }
+}
+
+/// Packs two coordinates into one message parameter (high and low 32 bits).
+pub fn pack_coords(a: i32, b: i32) -> usize {
+    (((a as u32) as u64) << 32 | (b as u32) as u64) as usize
+}
+
+/// Reverses `pack_coords`.
+pub fn unpack_coords(v: usize) -> (i32, i32) {
+    (((v as u64) >> 32) as u32 as i32, v as u64 as u32 as i32)
+}
+
 pub fn hiword(val: usize) -> u16 {
     ((val >> 16) & 0xFFFF) as u16
 }
@@ -809,7 +833,7 @@ pub fn destroy_border_for_window(tracking_window: HWND) {
     if let Some(&border_isize) = APP_STATE
         .borders
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(tracking_window.0 as isize))
     {
         let border_window = HWND(border_isize as _);
@@ -821,7 +845,7 @@ pub fn destroy_border_for_window(tracking_window: HWND) {
 }
 
 pub fn get_border_for_window(hwnd: HWND) -> Option<HWND> {
-    let borders_hashmap = APP_STATE.borders.lock().unwrap();
+    let borders_hashmap = APP_STATE.borders.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let hwnd_isize = hwnd.0 as isize;
     let Some(border_isize) = borders_hashmap.get(&hwnd_isize) else {
@@ -841,7 +865,11 @@ pub fn show_border_for_window(hwnd: HWND) {
         post_message_w(Some(border), WM_APP_SHOWUNCLOAKED, WPARAM(0), LPARAM(0))
             .context("show_border_for_window")
             .log_if_err();
-    } else if is_window_top_level(hwnd) && is_window_visible(hwnd) && !is_window_cloaked(hwnd) {
+    } else if crate::is_managed(hwnd)
+        && is_window_top_level(hwnd)
+        && is_window_visible(hwnd)
+        && !is_window_cloaked(hwnd)
+    {
         let window_rule = get_window_rule(hwnd);
 
         if window_rule.enabled == Some(EnableMode::Bool(false)) {
@@ -875,7 +903,7 @@ pub fn spawn_window_state_poller() {
     let _ = thread::spawn(move || {
         loop {
             // Handle any changes in terms of which window is foreground/active
-            let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
+            let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) as _);
             let new_active_hwnd = get_foreground_window();
             if new_active_hwnd != old_active_hwnd && !new_active_hwnd.is_invalid() {
                 handle_foreground_event(new_active_hwnd, old_active_hwnd);
@@ -885,7 +913,7 @@ pub fn spawn_window_state_poller() {
             let invalid_hwnds: Vec<HWND> = APP_STATE
                 .borders
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .keys()
                 .map(|tracking_isize| HWND(*tracking_isize as _))
                 .filter(|tracking_hwnd| !is_window(Some(*tracking_hwnd)))

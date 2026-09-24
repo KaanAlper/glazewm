@@ -25,6 +25,12 @@ pub extern "system" fn process_win_event(
     _dw_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    crate::guarded("win event hook", (), || {
+        handle_win_event(_event, _hwnd, _id_object, _id_child)
+    });
+}
+
+fn handle_win_event(_event: u32, _hwnd: HWND, _id_object: i32, _id_child: i32) {
     // Ignore cursor events
     if _id_object == OBJID_CURSOR.0 {
         return;
@@ -49,7 +55,7 @@ pub extern "system" fn process_win_event(
             }
 
             // Send reorder messages to all the border windows
-            for value in APP_STATE.borders.lock().unwrap().values() {
+            for value in APP_STATE.borders.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
                 let border_window = HWND(*value as _);
                 if is_window_visible(border_window) {
                     post_message_w(Some(border_window), WM_APP_REORDER, WPARAM(0), LPARAM(0))
@@ -104,11 +110,11 @@ pub fn handle_foreground_event(best_hwnd_guess: HWND, other_hwnd_guess: HWND) {
         true => best_hwnd_guess,
         false => other_hwnd_guess,
     };
-    *APP_STATE.active_window.lock().unwrap() = new_active_hwnd.0 as isize;
+    *APP_STATE.active_window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = new_active_hwnd.0 as isize;
 
     // Send foreground messages to all the border windows
     // TODO: I think only the previous focused and new focused actually need the message
-    for (key, val) in APP_STATE.borders.lock().unwrap().iter() {
+    for (key, val) in APP_STATE.borders.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
         let border_window = HWND(*val as _);
         // Some apps can become foreground even if they're not visible, so we also have to check
         // the keys against the active_window HWND from earlier

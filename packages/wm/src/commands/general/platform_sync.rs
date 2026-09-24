@@ -25,6 +25,16 @@ pub fn platform_sync(
   let focused_container =
     state.focused_container().context("No focused container.")?;
 
+  // Logical Lunge: only managed windows get a border.
+  #[cfg(target_os = "windows")]
+  wm_borders::set_managed(
+    state
+      .windows()
+      .iter()
+      .map(|window| native_handle(window))
+      .collect(),
+  );
+
   if state.pending_sync.needs_focus_update() {
     sync_focus(&focused_container, state)?;
   }
@@ -480,6 +490,11 @@ fn reposition_window(
         }
       }
 
+      // Logical Lunge: hide the border in the same step as the window.
+      if !is_visible {
+        wm_borders::hide(native_handle(window));
+      }
+
       // Set visibility based on the hide method.
       if config.value.general.hide_method == HideMethod::Cloak {
         window.native().set_cloaked(!is_visible)?;
@@ -488,10 +503,40 @@ fn reposition_window(
       } else {
         window.native().hide()?;
       }
+
+      // Logical Lunge: move (or show) the border in the same step as the
+      // window, at the window's visible frame (its rect without the
+      // invisible resize borders).
+      let has_frame = match window.state() {
+        WindowState::Tiling | WindowState::Floating(_) => true,
+        WindowState::Fullscreen(fullscreen) => !fullscreen.maximized,
+        WindowState::Minimized => false,
+      };
+
+      if is_visible && has_frame {
+        let frame = window
+          .to_rect()?
+          .apply_delta(&window.border_delta(), None);
+
+        wm_borders::place(
+          native_handle(window),
+          frame.left,
+          frame.top,
+          frame.right,
+          frame.bottom,
+        );
+      }
     }
   }
 
   Ok(())
+}
+
+/// Gets the window handle of a window as passed to the border engine.
+#[cfg(target_os = "windows")]
+#[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+fn native_handle(window: &WindowContainer) -> isize {
+  window.native().id().0 as isize
 }
 
 fn jump_cursor(

@@ -161,7 +161,7 @@ impl V2RenderBackend {
         border_window: HWND,
         create_extra_bitmaps: bool,
     ) -> WindowsCompatibleResult<Self> {
-        let directx_devices_opt = APP_STATE.directx_devices.read().unwrap();
+        let directx_devices_opt = APP_STATE.directx_devices.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let directx_devices = directx_devices_opt
             .as_ref()
             .context("could not get direct_devices")

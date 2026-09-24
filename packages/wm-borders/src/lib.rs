@@ -18,6 +18,7 @@ use anyhow::{Context, anyhow};
 use config::{Config, EnableMode};
 use render_backend::RenderBackendConfig;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
@@ -78,7 +79,7 @@ static IS_WINDOWS_11: LazyLock<bool> = LazyLock::new(|| {
 });
 pub static APP_STATE: LazyLock<AppState> = LazyLock::new(AppState::new);
 pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
-    LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap())));
+    LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap_or_else(std::sync::PoisonError::into_inner))));
 
 pub struct AppState {
     borders: Mutex<HashMap<isize, isize>>,
@@ -137,7 +138,7 @@ impl AppState {
 
     // The following getter/setters are meant for use in testing
     pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, Config> {
-        self.config.write().unwrap()
+        self.config.write().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn get_render_factory(&self) -> &ID2D1Factory1 {
@@ -145,7 +146,7 @@ impl AppState {
     }
 
     pub fn get_directx_devices_mut(&self) -> RwLockWriteGuard<'_, Option<DirectXDevices>> {
-        self.directx_devices.write().unwrap()
+        self.directx_devices.write().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -267,14 +268,14 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
+                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut()
                     && let Err(err) = directx_devices.recreate_if_needed()
                 {
                     error!("could not recreate directx devices if needed: {err:#}");
                     break;
                 }
 
-                for hwnd_isize in APP_STATE.borders.lock().unwrap().values() {
+                for hwnd_isize in APP_STATE.borders.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
                     let border_hwnd = HWND(*hwnd_isize as _);
                     post_message_w(
                         Some(border_hwnd),
@@ -471,7 +472,7 @@ pub fn destroy_borders() {
     let border_hwnds: Vec<HWND> = APP_STATE
         .borders
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .map(|hwnd_isize| HWND(*hwnd_isize as _))
         .collect();
@@ -538,14 +539,18 @@ pub fn destroy_borders() {
 
 pub fn reload_borders() {
     destroy_borders();
-    APP_STATE.initial_windows.lock().unwrap().clear();
+    APP_STATE.initial_windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     create_borders_for_existing_windows().log_if_err();
 }
 
 unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    guarded("create_borders_callback", TRUE, || create_border_if_needed(_hwnd))
+}
+
+fn create_border_if_needed(_hwnd: HWND) -> BOOL {
     if is_window_top_level(_hwnd) {
-        // Only create borders for visible windows
-        if is_window_visible(_hwnd) && !is_window_cloaked(_hwnd) {
+        // Only create borders for visible windows managed by the window manager
+        if is_managed(_hwnd) && is_window_visible(_hwnd) && !is_window_cloaked(_hwnd) {
             let window_rule = get_window_rule(_hwnd);
 
             if window_rule.enabled == Some(EnableMode::Bool(false)) {
@@ -561,7 +566,7 @@ unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) 
         APP_STATE
             .initial_windows
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(_hwnd.0 as isize);
     }
 
@@ -573,25 +578,122 @@ unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) 
 // There is no tray icon, IPC server, config file or auto start; the config is the `borders:`
 // section of the window manager config and is applied on every config reload.
 
+/// Runs `f` and logs a panic instead of letting it unwind. Used at every entry point called by the window manager
+/// and by Windows (window procedures, event hooks): the border engine shares its process with the window manager,
+/// and a panic unwinding out of an `extern "system"` callback aborts the whole process. A broken border engine must
+/// only cost the borders, never the window manager.
+pub(crate) fn guarded<R>(what: &str, fallback: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => {
+            error!("border engine: panic in {what}");
+            fallback
+        }
+    }
+}
+
 static CONFIG_SOURCE: Mutex<String> = Mutex::new(String::new());
 static ENGINE_THREAD_ID: Mutex<u32> = Mutex::new(0);
+// Set once the border window class is registered (borders can be created from other threads).
+static ENGINE_READY: AtomicBool = AtomicBool::new(false);
+// Windows managed by the window manager; only these get a border (like Hyprland, where every border belongs to a
+// managed window). The WM passes the whole set after each sync, so no manage/unmanage path can be missed, and no
+// hand-written exclusion list (bar, overlays, picture-in-picture...) is needed.
+static MANAGED: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(Default::default);
+
+pub(crate) fn is_managed(hwnd: HWND) -> bool {
+    MANAGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&(hwnd.0 as isize))
+}
+
+/// Sets the windows managed by the window manager. Newly managed windows get a border (if visible), windows that are
+/// no longer managed lose theirs. Can be called before `start`.
+pub fn set_managed(handles: HashSet<isize>) {
+    guarded("set_managed", (), || set_managed_impl(handles));
+}
+
+fn set_managed_impl(handles: HashSet<isize>) {
+    let (added, removed): (Vec<isize>, Vec<isize>) = {
+        let mut managed = MANAGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *managed == handles {
+            return;
+        }
+        let added = handles.difference(&managed).copied().collect();
+        let removed = managed.difference(&handles).copied().collect();
+        *managed = handles;
+        (added, removed)
+    };
+
+    if !ENGINE_READY.load(Ordering::Acquire) {
+        return;
+    }
+    for hwnd in removed {
+        utils::destroy_border_for_window(HWND(hwnd as _));
+    }
+    for hwnd in added {
+        utils::show_border_for_window(HWND(hwnd as _));
+    }
+}
+
+/// Moves the border of a window to `frame` (the window's visible frame, as just requested by the window manager)
+/// right away, in the same step as the window, instead of following it after the window has moved. The window's own
+/// move then only confirms the position. Also shows the border of a window that is being uncloaked.
+pub fn place(hwnd: isize, left: i32, top: i32, right: i32, bottom: i32) {
+    guarded("place", (), || place_impl(hwnd, left, top, right, bottom));
+}
+
+fn place_impl(hwnd: isize, left: i32, top: i32, right: i32, bottom: i32) {
+    if !ENGINE_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(border) = utils::get_border_for_window(HWND(hwnd as _)) {
+        post_message_w(
+            Some(border),
+            utils::WM_APP_PLACE,
+            WPARAM(utils::pack_coords(left, top)),
+            LPARAM(utils::pack_coords(right, bottom) as isize),
+        )
+        .context("place")
+        .log_if_err();
+    }
+}
+
+/// Hides the border of a window the window manager is hiding, in the same step as the window (the CLOAKED event
+/// would come a moment later, leaving the border on screen for a frame, e.g. on a workspace switch).
+pub fn hide(hwnd: isize) {
+    guarded("hide", (), || hide_impl(hwnd));
+}
+
+fn hide_impl(hwnd: isize) {
+    if !ENGINE_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(border) = utils::get_border_for_window(HWND(hwnd as _)) {
+        post_message_w(Some(border), utils::WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
+            .context("hide")
+            .log_if_err();
+    }
+}
 
 pub(crate) fn config_source() -> String {
-    CONFIG_SOURCE.lock().unwrap().clone()
+    CONFIG_SOURCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// Starts the border engine. `config_yaml` is the `borders:` section of the WM config.
 pub fn start(config_yaml: String) {
-    *CONFIG_SOURCE.lock().unwrap() = config_yaml;
+    guarded("start", (), || start_impl(config_yaml));
+}
 
-    if *ENGINE_THREAD_ID.lock().unwrap() != 0 {
+fn start_impl(config_yaml: String) {
+    *CONFIG_SOURCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = config_yaml;
+
+    if *ENGINE_THREAD_ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner) != 0 {
         return;
     }
 
     let spawned = thread::Builder::new()
         .name("borders".into())
         .spawn(|| {
-            *ENGINE_THREAD_ID.lock().unwrap() =
+            *ENGINE_THREAD_ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
             let _ = LazyLock::force(&APP_STATE);
@@ -605,6 +707,7 @@ pub fn start(config_yaml: String) {
 
             let hook = set_event_hook();
             register_border_window_class().log_if_err();
+            ENGINE_READY.store(true, Ordering::Release);
             create_borders_for_existing_windows().log_if_err();
             utils::spawn_window_state_poller();
 
@@ -620,7 +723,8 @@ pub fn start(config_yaml: String) {
                 let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(hook);
             }
 
-            *ENGINE_THREAD_ID.lock().unwrap() = 0;
+            ENGINE_READY.store(false, Ordering::Release);
+            *ENGINE_THREAD_ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
             info!("border engine stopped");
         });
 
@@ -631,15 +735,19 @@ pub fn start(config_yaml: String) {
 
 /// Applies a new `borders:` section; borders are recreated only if it changed.
 pub fn reload(config_yaml: String) {
-    *CONFIG_SOURCE.lock().unwrap() = config_yaml;
+    guarded("reload", (), || reload_impl(config_yaml));
+}
 
-    if *ENGINE_THREAD_ID.lock().unwrap() == 0 {
+fn reload_impl(config_yaml: String) {
+    *CONFIG_SOURCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = config_yaml;
+
+    if *ENGINE_THREAD_ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == 0 {
         return;
     }
 
-    let old_config = (*APP_STATE.config.read().unwrap()).clone();
+    let old_config = (*APP_STATE.config.read().unwrap_or_else(std::sync::PoisonError::into_inner)).clone();
     Config::reload();
-    let changed = old_config != *APP_STATE.config.read().unwrap();
+    let changed = old_config != *APP_STATE.config.read().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     if changed {
         info!("border config changed; recreating borders");
@@ -649,13 +757,18 @@ pub fn reload(config_yaml: String) {
 
 /// Removes every border and stops the engine thread (on WM exit).
 pub fn stop() {
-    let thread_id = *ENGINE_THREAD_ID.lock().unwrap();
+    guarded("stop", (), stop_impl);
+}
+
+fn stop_impl() {
+    let thread_id = *ENGINE_THREAD_ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if thread_id == 0 {
         return;
     }
 
+    ENGINE_READY.store(false, Ordering::Release);
     destroy_borders();
-    BG_SERVICES.lock().unwrap().shutdown();
+    BG_SERVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shutdown();
 
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(

@@ -264,9 +264,9 @@ impl Config {
     pub fn reload() {
         let new_config = match Self::create() {
             Ok(config) => {
-                BG_SERVICES.lock().unwrap().reload(&config);
+                BG_SERVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reload(&config);
 
-                let mut directx_devices_opt = APP_STATE.directx_devices.write().unwrap();
+                let mut directx_devices_opt = APP_STATE.directx_devices.write().unwrap_or_else(std::sync::PoisonError::into_inner);
 
                 if config.render_backend == RenderBackendConfig::V2 && directx_devices_opt.is_none()
                 {
@@ -291,7 +291,7 @@ impl Config {
                 Config::default()
             }
         };
-        *APP_STATE.config.write().unwrap() = new_config;
+        *APP_STATE.config.write().unwrap_or_else(std::sync::PoisonError::into_inner) = new_config;
     }
 
     pub fn is_theme_aware_enabled(&self) -> bool {
