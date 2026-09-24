@@ -787,6 +787,22 @@ impl WindowManager {
   ) {
     self.state.emit_event(WmEvent::ApplicationExiting);
 
+    // Bring back the windows of hidden workspaces. They are cloaked (or
+    // hidden) and would otherwise stay invisible after the WM exits, e.g.
+    // on an update, an uninstall or a restart.
+    #[cfg(target_os = "windows")]
+    for window in self.state.windows() {
+      let result = match config.value.general.hide_method {
+        wm_common::HideMethod::Cloak => window.native().set_cloaked(false),
+        wm_common::HideMethod::Hide => window.native().show(),
+        wm_common::HideMethod::PlaceInCorner => Ok(()),
+      };
+
+      if let Err(err) = result {
+        tracing::warn!("Failed to restore window on exit: {:?}", err);
+      }
+    }
+
     // Ensure that the WM is unpaused, otherwise, shutdown commands won't
     // get executed.
     self.state.is_paused = false;
