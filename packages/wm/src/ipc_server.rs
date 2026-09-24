@@ -39,13 +39,42 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
+  /// Binds the IPC server's listener, retrying for up to 30 seconds while
+  /// the port is in use.
+  ///
+  /// Logical Lunge: after a crash, the previous instance's sockets can
+  /// outlive it for a while (e.g. while its process is still being torn
+  /// down); the WM then starts once the port is free instead of failing.
+  async fn bind_with_retry(addr: &str) -> anyhow::Result<TcpListener> {
+    const ATTEMPTS: u32 = 30;
+
+    for attempt in 1..=ATTEMPTS {
+      match TcpListener::bind(addr).await {
+        Ok(listener) => return Ok(listener),
+        Err(err)
+          if err.kind() == std::io::ErrorKind::AddrInUse
+            && attempt < ATTEMPTS =>
+        {
+          if attempt == 1 {
+            warn!("IPC port '{}' is in use; waiting for it.", addr);
+          }
+
+          tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        Err(err) => return Err(err.into()),
+      }
+    }
+
+    bail!("IPC port '{}' stayed in use.", addr)
+  }
+
   pub async fn start() -> anyhow::Result<Self> {
     let (message_tx, message_rx) = mpsc::unbounded_channel();
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
     let server_addr = format!("127.0.0.1:{DEFAULT_IPC_PORT}");
-    let server = TcpListener::bind(server_addr.clone()).await?;
+    let server = Self::bind_with_retry(&server_addr).await?;
     info!("IPC server started on: '{}'.", server_addr);
 
     let task = task::spawn(async move {

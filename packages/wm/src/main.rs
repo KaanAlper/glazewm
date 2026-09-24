@@ -122,6 +122,11 @@ async fn start_wm(
   // Logical Lunge: no tray icon -- the shell's bar is the UI (reload / exit are
   // available as keybindings and through IPC).
 
+  // Logical Lunge: the IPC server starts before any window is touched. If
+  // it can't start, the WM exits without having hidden (cloaked) the
+  // windows of other workspaces, which would otherwise stay invisible.
+  let mut ipc_server = IpcServer::start().await?;
+
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
 
   // Logical Lunge: window borders are drawn inside the WM process (no
@@ -130,8 +135,6 @@ async fn start_wm(
   if let Some(borders) = &config.value.borders {
     wm_borders::start(serde_json::to_string(borders).unwrap_or_default());
   }
-
-  let mut ipc_server = IpcServer::start().await?;
 
   // On Windows, start watcher process for restoring hidden windows on
   // crash. macOS' hidden windows are always accessible.
