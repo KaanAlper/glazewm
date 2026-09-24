@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_DEVICE_REMOVED,
     DXGI_GPU_PREFERENCE_UNSPECIFIED, IDXGIAdapter, IDXGIFactory6,
 };
-use windows::Win32::Graphics::Gdi::{CreateRectRgn, HMONITOR, ValidateRect};
+use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, HMONITOR, ValidateRect};
 use windows::Win32::UI::HiDpi::MDT_DEFAULT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW,
@@ -169,8 +169,13 @@ impl WindowBorder {
                     fTransitionOnMaximized: FALSE,
                 };
             }
-            DwmEnableBlurBehindWindow(self.border_window.0, &bh)
-                .context("could not make window transparent")?;
+            let blur = DwmEnableBlurBehindWindow(self.border_window.0, &bh);
+            // DWM copies the region, so it is freed here (PowerToys holds it in a `wil::unique_hrgn`).
+            // Without this every created border leaked one GDI region, up to the 10k per-process quota.
+            if !hrgn.is_invalid() {
+                let _ = DeleteObject(hrgn.into());
+            }
+            blur.context("could not make window transparent")?;
             SetLayeredWindowAttributes(self.border_window.0, COLORREF(0x00000000), 255, LWA_ALPHA)
                 .context("could not set LWA_ALPHA")?;
 
