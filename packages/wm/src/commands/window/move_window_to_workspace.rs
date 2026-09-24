@@ -4,7 +4,11 @@ use wm_common::WindowState;
 
 use crate::{
   commands::{
-    container::{move_container_within_tree, set_focused_descendant},
+    container::{
+      move_container_within_tree, normalize_split_containers,
+      set_focused_descendant,
+    },
+    window::dwindle_place,
     workspace::activate_workspace,
   },
   models::{WindowContainer, WorkspaceTarget},
@@ -108,6 +112,17 @@ pub fn move_window_to_workspace(
         )?;
       }
     }
+
+    // Logical Lunge: like Hyprland, a tiling window moved to another
+    // workspace splits that workspace's last focused tiling window (dwindle)
+    // instead of being appended next to it; neither workspace keeps
+    // redundant splits.
+    if let WindowContainer::TilingWindow(tiling_window) = &window {
+      dwindle_place(tiling_window, false, state, config)?;
+    }
+
+    normalize_split_containers(&current_workspace.clone().into())?;
+    normalize_split_containers(&target_workspace.clone().into())?;
 
     // When moving a focused window within the tree to another workspace,
     // the target workspace will get displayed. If moving the window e.g.

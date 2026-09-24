@@ -2,7 +2,7 @@ use anyhow::Context;
 
 use super::flatten_split_container;
 use crate::{
-  models::Container,
+  models::{Container, TilingContainer},
   traits::{CommonGetters, TilingSizeGetters, MIN_TILING_SIZE},
 };
 
@@ -25,6 +25,11 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
 
   let parent = child_to_remove.parent().context("No parent.")?;
 
+  // Position among the tiling children, for finding its split partner.
+  let tiling_index = parent
+    .tiling_children()
+    .position(|c| c.id() == child_to_remove.id());
+
   parent
     .borrow_children_mut()
     .retain(|c| c.id() != child_to_remove.id());
@@ -38,6 +43,18 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
   // Resize the siblings if it is a tiling container.
   if let Ok(child_to_remove) = child_to_remove.as_tiling_container() {
     let tiling_siblings = parent.tiling_children().collect::<Vec<_>>();
+
+    // Logical Lunge: like Hyprland's dwindle layout, the freed space goes
+    // to the removed container's split partner.
+    if let Some(partner) = tiling_index.and_then(|index| {
+      split_partner(&tiling_siblings, index, child_to_remove.tiling_size())
+    }) {
+      partner.set_tiling_size(
+        partner.tiling_size() + child_to_remove.tiling_size(),
+      );
+
+      return Ok(());
+    }
 
     // TODO: Share logic with `resize_tiling_container`.
     let available_size =
@@ -56,4 +73,40 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
   }
 
   Ok(())
+}
+
+/// Finds the sibling that takes over the space of a removed container, as
+/// in Hyprland's dwindle layout where the removed window's split partner
+/// fills their split.
+///
+/// New splits are 50/50, so in a flattened split the partner is an
+/// adjacent sibling with the same size. Spreading the space over all
+/// siblings instead skewed the layout a bit more with every move (e.g.
+/// 20/80 rows). Returns `None` when all siblings have that size (equal
+/// rows/columns, where an even spread is right) or when no adjacent
+/// sibling has it (e.g. after a manual resize).
+fn split_partner(
+  siblings: &[TilingContainer],
+  removed_index: usize,
+  removed_size: f32,
+) -> Option<TilingContainer> {
+  const TOLERANCE: f32 = 0.01;
+
+  let same_size = |sibling: &&TilingContainer| {
+    (sibling.tiling_size() - removed_size).abs() < TOLERANCE
+  };
+
+  if siblings.iter().all(|sibling| same_size(&sibling)) {
+    return None;
+  }
+
+  let previous = removed_index
+    .checked_sub(1)
+    .and_then(|index| siblings.get(index));
+  let next = siblings.get(removed_index);
+
+  previous
+    .filter(same_size)
+    .or_else(|| next.filter(same_size))
+    .cloned()
 }

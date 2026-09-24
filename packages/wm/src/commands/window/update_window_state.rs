@@ -153,6 +153,10 @@ fn set_non_tiling(
         window.index(),
       )?;
 
+      // Logical Lunge: e.g. V[1 H[2 3]] with 3 minimized left H[2] behind
+      // (a single-child split, which later moves turned into odd rows).
+      normalize_split_containers(&workspace.clone().into())?;
+
       state
         .pending_sync
         .queue_container_to_redraw(non_tiling_window.clone())
