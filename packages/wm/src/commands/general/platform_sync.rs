@@ -12,16 +12,51 @@ use wm_platform::{CornerStyle, OpacityValue};
 use wm_platform::{Rect, WindowZOrder};
 
 use crate::{
+  commands::container::normalize_split_containers,
   models::{Container, WindowContainer},
-  traits::{CommonGetters, PositionGetters, WindowGetters},
+  traits::{
+    CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
+  },
   user_config::UserConfig,
   wm_state::WmState,
 };
+
+/// Whether any split below `root` has a single child or the same tiling
+/// direction as its parent (see `normalize_split_containers`).
+fn has_redundant_splits(root: &Container) -> bool {
+  root.descendants().any(|container| {
+    let Some(split) = container.as_split() else {
+      return false;
+    };
+
+    split.child_count() == 1
+      || split.parent().is_some_and(|parent| {
+        parent.as_direction_container().is_ok_and(|parent| {
+          parent.tiling_direction() == split.tiling_direction()
+        })
+      })
+  })
+}
 
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  // Logical Lunge: the tree never keeps a split with a single child or with
+  // its parent's direction (dwindle has neither). Some path still left e.g.
+  // `H[1]` inside a column, and later moves then acted on unexpected
+  // neighbours. Enforced once per sync, whatever produced it.
+  for workspace in state.workspaces() {
+    let root: Container = workspace.clone().into();
+
+    if has_redundant_splits(&root) {
+      normalize_split_containers(&root)?;
+      state
+        .pending_sync
+        .queue_containers_to_redraw(workspace.tiling_children());
+    }
+  }
+
   let focused_container =
     state.focused_container().context("No focused container.")?;
 

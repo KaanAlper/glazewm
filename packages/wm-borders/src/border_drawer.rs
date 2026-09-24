@@ -189,30 +189,9 @@ impl BorderDrawer {
             render_target.BeginDraw();
             render_target.Clear(None);
 
-            if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = bottom_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match bottom_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for bottom_color has not been created yet"),
-                }
-            }
-            if top_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = top_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match top_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for top_color has not been created yet"),
-                }
-            }
+            self.paint_colors(bottom_color, top_color, &bounds, render_target, &|brush| {
+                self.draw_rectangle(&stroke_rect, render_target, brush)
+            })?;
 
             render_target.EndDraw(None, None)?;
         }
@@ -268,30 +247,9 @@ impl BorderDrawer {
             d2d_context.BeginDraw();
             d2d_context.Clear(None);
 
-            if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = bottom_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match bottom_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for bottom_color has not been created yet"),
-                }
-            }
-            if top_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = top_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match top_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for top_color has not been created yet"),
-                }
-            }
+            self.paint_colors(bottom_color, top_color, &bounds, d2d_context, &|brush| {
+                self.draw_rectangle(&stroke_rect, d2d_context, brush)
+            })?;
 
             d2d_context.EndDraw(None, None)?;
 
@@ -358,30 +316,9 @@ impl BorderDrawer {
             // We use filled rectangles here because it helps make the effects more visible.
             // Additionally, if someone sets the stroke width to 0, the effects will still be
             // visible (whereas they wouldn't be if we used a hollow rectangle).
-            if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = bottom_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match bottom_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.fill_rectangle(&border_outer_rect, d2d_context, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for bottom_color has not been created yet"),
-                }
-            }
-            if top_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = top_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match top_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.fill_rectangle(&border_outer_rect, d2d_context, id2d1_brush)
-                    }
-                    None => debug!("ID2D1Brush for top_color has not been created yet"),
-                }
-            }
+            self.paint_colors(bottom_color, top_color, &bounds, d2d_context, &|brush| {
+                self.fill_rectangle(&border_outer_rect, d2d_context, brush)
+            })?;
 
             d2d_context.EndDraw(None, None)?;
         }
@@ -480,6 +417,40 @@ impl BorderDrawer {
                 .windows_context("d_comp_device.Commit()")?;
 
             d2d_multithread.Leave();
+        }
+
+        Ok(())
+    }
+
+    // Paints the border's color(s) for the current fade state. Logical Lunge: mid-fade between two
+    // solid colors, a single color mixed in OkLab is painted (see `ColorBrush::fade_mix_with`);
+    // otherwise the fading-out color is painted under the fading-in one, as before.
+    fn paint_colors(
+        &self,
+        bottom_color: &ColorBrush,
+        top_color: &ColorBrush,
+        bounds: &D2D_RECT_F,
+        renderer: &ID2D1RenderTarget,
+        paint: &dyn Fn(&ID2D1Brush),
+    ) -> WindowsCompatibleResult<()> {
+        if let Some(mixed) = top_color.fade_mix_with(bottom_color) {
+            // SAFETY: `renderer` is a live render target inside BeginDraw/EndDraw.
+            let brush = unsafe { renderer.CreateSolidColorBrush(&mixed, None)? };
+            paint((&brush).into());
+            return Ok(());
+        }
+
+        for (color, name) in [(bottom_color, "bottom_color"), (top_color, "top_color")] {
+            if color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
+                if let ColorBrush::Gradient(gradient) = color {
+                    gradient.update_start_end_points(bounds);
+                }
+
+                match color.get_brush() {
+                    Some(id2d1_brush) => paint(id2d1_brush),
+                    None => debug!("ID2D1Brush for {name} has not been created yet"),
+                }
+            }
         }
 
         Ok(())

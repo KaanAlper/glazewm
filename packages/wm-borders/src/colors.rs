@@ -246,6 +246,27 @@ impl ColorBrush {
         Ok(())
     }
 
+    /// Logical Lunge: the color to draw while fading from `bottom` (fading out) to `self` (fading
+    /// in), mixed in OkLab like Hyprland. Drawing the two brushes on top of each other with
+    /// complementary opacities left the border half transparent mid-way.
+    ///
+    /// Returns `None` when not mid-fade or when a gradient is involved (those keep the cross-fade).
+    pub fn fade_mix_with(&self, bottom: &ColorBrush) -> Option<D2D1_COLOR_F> {
+        let (ColorBrush::Solid(top_solid), ColorBrush::Solid(bottom_solid)) = (self, bottom) else {
+            return None;
+        };
+        let (top_opacity, bottom_opacity) = (self.get_opacity().ok()?, bottom.get_opacity().ok()?);
+        if top_opacity <= 0.0 || bottom_opacity <= 0.0 {
+            return None;
+        }
+
+        Some(oklab_mix(
+            &bottom_solid.color,
+            &top_solid.color,
+            top_opacity / (top_opacity + bottom_opacity),
+        ))
+    }
+
     pub fn get_opacity(&self) -> anyhow::Result<f32> {
         match self {
             ColorBrush::Solid(solid) => {
@@ -420,6 +441,115 @@ fn parse_hex(s: &str) -> anyhow::Result<D2D1_COLOR_F> {
         Ok(D2D1_COLOR_F { r, g, b, a })
     } else {
         Err(anyhow!("invalid hex: {s}"))
+    }
+}
+
+/// Mixes two sRGB colors in OkLab (`t` = 0 gives `from`, 1 gives `to`); alpha is mixed linearly.
+///
+/// OkLab keeps the perceived lightness and hue changing evenly, so a fade between two colors
+/// doesn't pass through a muddy or darker middle like an sRGB mix does.
+pub fn oklab_mix(from: &D2D1_COLOR_F, to: &D2D1_COLOR_F, t: f32) -> D2D1_COLOR_F {
+    let t = t.clamp(0.0, 1.0);
+    let a = srgb_to_oklab(from);
+    let b = srgb_to_oklab(to);
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    let [r, g, bl] = oklab_to_srgb([lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2])]);
+
+    D2D1_COLOR_F {
+        r,
+        g,
+        b: bl,
+        a: lerp(from.a, to.a),
+    }
+}
+
+/// sRGB (0..1) to OkLab `[L, a, b]` (Björn Ottosson's reference conversion).
+fn srgb_to_oklab(c: &D2D1_COLOR_F) -> [f32; 3] {
+    let lin = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin(c.r), lin(c.g), lin(c.b));
+
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+/// OkLab `[L, a, b]` to sRGB (0..1), clamped to the sRGB gamut.
+fn oklab_to_srgb(lab: [f32; 3]) -> [f32; 3] {
+    let [lightness, a, b] = lab;
+    let l = (lightness + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m = (lightness - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s = (lightness - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+
+    let r = 4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s;
+    let g = -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s;
+    let bl = -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s;
+
+    let gamma = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        }
+    };
+
+    [gamma(r), gamma(g), gamma(bl)]
+}
+
+#[cfg(test)]
+mod oklab_tests {
+    use super::*;
+
+    fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
+        D2D1_COLOR_F { r, g, b, a }
+    }
+
+    fn close(x: &D2D1_COLOR_F, y: &D2D1_COLOR_F) -> bool {
+        (x.r - y.r).abs() < 0.002
+            && (x.g - y.g).abs() < 0.002
+            && (x.b - y.b).abs() < 0.002
+            && (x.a - y.a).abs() < 0.002
+    }
+
+    #[test]
+    fn mix_endpoints_are_the_inputs() {
+        // The config's active and inactive border colors.
+        let active = color(0xb6 as f32 / 255.0, 0x9d as f32 / 255.0, 0xf8 as f32 / 255.0, 0.8);
+        let inactive = color(0x3a as f32 / 255.0, 0x3a as f32 / 255.0, 0x40 as f32 / 255.0, 0.6);
+
+        assert!(close(&oklab_mix(&inactive, &active, 0.0), &inactive));
+        assert!(close(&oklab_mix(&inactive, &active, 1.0), &active));
+    }
+
+    #[test]
+    fn mix_midpoint_is_perceptual() {
+        // Halfway between black and white in OkLab is L = 0.5, which is sRGB ~0.389 (an sRGB
+        // mix would give 0.5, which looks too light).
+        let mid = oklab_mix(&color(0.0, 0.0, 0.0, 1.0), &color(1.0, 1.0, 1.0, 1.0), 0.5);
+
+        assert!((mid.r - 0.389).abs() < 0.01, "{}", mid.r);
+        assert!((mid.r - mid.g).abs() < 0.002 && (mid.g - mid.b).abs() < 0.002);
+        assert!((mid.a - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mix_alpha_is_linear() {
+        let mid = oklab_mix(&color(1.0, 0.0, 0.0, 0.2), &color(1.0, 0.0, 0.0, 0.6), 0.5);
+
+        assert!((mid.a - 0.4).abs() < 0.001);
+        assert!((mid.r - 1.0).abs() < 0.002 && mid.g < 0.002 && mid.b < 0.002);
     }
 }
 
